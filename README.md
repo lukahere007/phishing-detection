@@ -21,7 +21,7 @@ An end‑to‑end R pipeline comparing Random Forest and Gradient Boosting class
 
 ## 🗂️ Data
 
-- **Source file:** `(https://www.kaggle.com/datasets/ethancratchley/email-phishing-dataset/data)`  
+- **Source file:** [DATA](https://www.kaggle.com/datasets/ethancratchley/email-phishing-dataset/data)  
 - **Features:** NLP‑derived indicators (token counts, URL flags, header cues, etc.)  
 - **Target:** `label` (factor with levels `ham` / `phish`)
 
