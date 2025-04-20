@@ -1,0 +1,352 @@
+---
+title: "phishing detection analysis"
+author: "Luke Wamalwa"
+date: "2025-04-20"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# ─────────────────────────────────────────────────────────────────────────────
+# 0) Load libraries
+# ─────────────────────────────────────────────────────────────────────────────
+library(caret)         # for createDataPartition, downSample, upSample, confusionMatrix
+library(ROSE)          # for ovun.sample
+library(randomForest)  # Random Forest
+library(gbm)           # Gradient boosting
+set.seed(42)
+file_path <- "C:/Users/lukew/OneDrive/Desktop/Lukas/Python/email_phishing_data.csv"
+df <- read.csv(file_path)
+df <- df[sample(nrow(df), 50000), ]
+df$label  <- factor(df$label, levels = c(0,1), labels = c("ham","phish"))
+
+```
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1) sPLIT Data
+# ─────────────────────────────────────────────────────────────────────────────
+```{r}
+train_idx  <- createDataPartition(df$label, p = 0.60, list = FALSE)
+train_all  <- df[ train_idx, ]
+rest       <- df[-train_idx, ]
+
+val_idx    <- createDataPartition(rest$label, p = 0.50, list = FALSE)
+validation <- rest[ val_idx, ]
+test       <- rest[-val_idx, ]
+
+predictors <- setdiff(names(train_all), "label")
+```
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2) Balance the TRAINING set four ways
+# ─────────────────────────────────────────────────────────────────────────────
+
+```{r}
+train_down <- downSample(x = train_all[, predictors],
+                         y = train_all$label,
+                         yname = "label")
+train_up   <- upSample(  x = train_all[, predictors],
+                         y = train_all$label,
+                         yname = "label")
+N_target   <- max(table(train_all$label)) * 2
+train_rose <- ovun.sample(label ~ ., data = train_all,
+                          method = "both",
+                          N      = N_target,
+                          seed   = 42)$data
+
+train_sets <- list(
+  Original = train_all,
+  Down     = train_down,
+  Up       = train_up,
+  ROSE     = train_rose
+)
+```
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3) Helpers: compute metrics & find best threshold
+# ─────────────────────────────────────────────────────────────────────────────
+
+```{r}
+compute_metrics <- function(probs, truth, thr) {
+  pred <- factor(ifelse(probs > thr, "phish", "ham"),
+                 levels = c("ham","phish"))
+  cm    <- confusionMatrix(pred, truth, positive = "phish")
+  sens  <- cm$byClass["Sensitivity"]
+  spec  <- cm$byClass["Specificity"]
+  prec  <- cm$byClass["Pos Pred Value"]
+  rec   <- sens
+  ba    <- (sens + spec) / 2
+  f1    <- ifelse((prec + rec)==0, NA, 2*prec*rec/(prec + rec))
+  c(Threshold = thr,
+    BalancedAccuracy = ba,
+    Precision = prec,
+    Recall = rec,
+    F1 = f1)
+}
+
+find_best_threshold <- function(probs, truth) {
+  ths    <- seq(0.01, 0.99, by = 0.01)
+  metrics <- t(sapply(ths, function(t) compute_metrics(probs, truth, t)))
+  metrics_df <- as.data.frame(metrics)
+  best <- which.max(metrics_df$F1)
+  metrics_df[best, , drop = FALSE]
+}
+```
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4) Train ensembles & evaluate on validation
+# ─────────────────────────────────────────────────────────────────────────────
+
+```{r}
+results <- NULL
+for(balance in names(train_sets)) {
+  tr <- train_sets[[balance]]
+  
+  # ---- Random Forest ----
+  tr$label <- factor(tr$label, levels = c("ham","phish"))
+  rf_mod   <- randomForest(label ~ ., data = tr, ntree = 100)
+  rf_prob  <- predict(rf_mod, validation, type = "prob")[, "phish"]
+  rf_best  <- find_best_threshold(rf_prob, validation$label)
+  rf_row   <- data.frame(
+    Sampling         = balance,
+    Model            = "RandomForest",
+    Threshold        = rf_best$Threshold,
+    BalancedAccuracy = rf_best$BalancedAccuracy,
+    Precision        = rf_best$Precision,
+    Recall           = rf_best$Recall,
+    F1               = rf_best$F1,
+    row.names = NULL
+  )
+  
+  # ---- GBM (numeric 0/1 response) ----
+  tr_gbm         <- tr
+  tr_gbm$label_n <- ifelse(tr_gbm$label == "phish", 1, 0)
+  gbm_mod        <- gbm(label_n ~ ., data = tr_gbm[, c(predictors, "label_n")],
+                        distribution     = "bernoulli",
+                        n.trees          = 100,
+                        interaction.depth = 3,
+                        shrinkage        = 0.1,
+                        bag.fraction     = 0.8,
+                        n.minobsinnode   = 5,
+                        verbose          = FALSE)
+  gbm_prob <- predict(gbm_mod,
+                      newdata = validation[, predictors],
+                      n.trees = 100,
+                      type    = "response")
+  gbm_best <- find_best_threshold(gbm_prob, validation$label)
+  gbm_row  <- data.frame(
+    Sampling         = balance,
+    Model            = "GBM",
+    Threshold        = gbm_best$Threshold,
+    BalancedAccuracy = gbm_best$BalancedAccuracy,
+    Precision        = gbm_best$Precision,
+    Recall           = gbm_best$Recall,
+    F1               = gbm_best$F1,
+    row.names = NULL
+  )
+  
+  results <- rbind(results, rf_row, gbm_row)
+}
+
+```
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5) Show the results
+# ─────────────────────────────────────────────────────────────────────────────
+
+```{r}
+print(results)
+```
+
+
+
+
+
+```{r}
+# 1) Pick the row with the highest Recall
+best_rec_row   <- results[which.max(results$Recall), ]
+best_sampling  <- best_rec_row$Sampling
+best_model     <- best_rec_row$Model
+best_threshold <- best_rec_row$Threshold
+
+cat("Highest‑Recall champion:\n",
+    " Sampling:  ", best_sampling, "\n",
+    " Model:     ", best_model, "\n",
+    " Threshold: ", best_threshold, "\n\n")
+
+# 2) Build the full 80% dev set
+dev_set <- rbind(train_all, validation)
+
+# 3) Balance dev_set exactly as chosen
+if (best_sampling == "Original") {
+  dev_train <- dev_set
+} else if (best_sampling == "Down") {
+  dev_train <- downSample(
+    x     = dev_set[, predictors],
+    y     = dev_set$label,
+    yname = "label"
+  )
+} else if (best_sampling == "Up") {
+  dev_train <- upSample(
+    x     = dev_set[, predictors],
+    y     = dev_set$label,
+    yname = "label"
+  )
+} else if (best_sampling == "ROSE") {
+  N_target  <- max(table(dev_set$label)) * 2
+  dev_train <- ovun.sample(
+    label ~ ., data   = dev_set,
+    method          = "both",
+    N               = N_target,
+    seed            = 42
+  )$data
+}
+
+# 4) Retrain the chosen model
+if (best_model == "RandomForest") {
+  dev_train$label <- factor(dev_train$label, levels = c("ham","phish"))
+  champ_mod       <- randomForest(label ~ ., data = dev_train, ntree = 100)
+  predict_prob    <- function(mod, newdata) {
+    predict(mod, newdata, type = "prob")[, "phish"]
+  }
+
+} else if (best_model == "GBM") {
+  dev_train$label_n <- ifelse(dev_train$label == "phish", 1, 0)
+  champ_mod         <- gbm(
+    label_n ~ ., data            = dev_train[, c(predictors, "label_n")],
+    distribution     = "bernoulli",
+    n.trees          = 100,
+    interaction.depth = 3,
+    shrinkage        = 0.1,
+    bag.fraction     = 0.8,
+    n.minobsinnode   = 5,
+    verbose          = FALSE
+  )
+  predict_prob      <- function(mod, newdata) {
+    predict(mod, newdata, n.trees = 100, type = "response")
+  }
+
+} else {
+  stop("Unknown model: ", best_model)
+}
+
+# 5) Score on TEST at that Recall‑maximizing threshold
+test_prob <- predict_prob(champ_mod, test)
+test_pred <- factor(
+  ifelse(test_prob > best_threshold, "phish", "ham"),
+  levels = c("ham","phish")
+)
+
+cm      <- confusionMatrix(test_pred, test$label, positive = "phish")$byClass
+sens    <- cm["Sensitivity"]
+spec    <- cm["Specificity"]
+prec    <- cm["Pos Pred Value"]
+ba      <- (sens + spec) / 2
+f1      <- ifelse((prec + sens)==0, NA, 2*prec*sens/(prec + sens))
+
+final_recall_champ <- data.frame(
+  Sampling         = best_sampling,
+  Model            = best_model,
+  Threshold        = best_threshold,
+  BalancedAccuracy = ba,
+  Precision        = prec,
+  Recall           = sens,
+  F1               = f1,
+  row.names        = NULL
+)
+
+print(final_recall_champ)
+
+```
+```{r}
+
+# 1) Define the two models to refit
+to_refit <- data.frame(
+  Sampling  = c("Original", "Original"),
+  Model     = c("RandomForest", "GBM"),
+  Threshold = c(0.09, 0.06),
+  stringsAsFactors = FALSE
+)
+
+# 2) Build the full 80% development set
+dev_set <- rbind(train_all, validation)
+
+# 3) Prepare a placeholder for the final metrics
+final_two <- data.frame()
+
+# 4) Loop over each champion spec
+for(i in seq_len(nrow(to_refit))) {
+  samp <- to_refit$Sampling[i]
+  modn <- to_refit$Model[i]
+  thr  <- to_refit$Threshold[i]
+  
+  # 4a) For "Original", dev_train is just the dev_set
+  dev_train <- dev_set
+  
+  # 4b) Fit the specified model
+  if(modn == "RandomForest") {
+    library(randomForest)
+    dev_train$label <- factor(dev_train$label, levels=c("ham","phish"))
+    fit <- randomForest(label ~ ., data = dev_train, ntree = 100)
+    pred_prob <- predict(fit, test, type="prob")[, "phish"]
+    
+  } else if(modn == "GBM") {
+    library(gbm)
+    tmp <- dev_train
+    tmp$label_n <- ifelse(tmp$label=="phish", 1, 0)
+    fit <- gbm(
+      label_n ~ ., data            = tmp[, c(predictors, "label_n")],
+      distribution     = "bernoulli",
+      n.trees          = 100,
+      interaction.depth = 3,
+      shrinkage        = 0.1,
+      bag.fraction     = 0.8,
+      n.minobsinnode   = 5,
+      verbose          = FALSE
+    )
+    pred_prob <- predict(fit, newdata = test[, predictors],
+                         n.trees = 100, type = "response")
+    
+  } else {
+    stop("Unknown model: ", modn)
+  }
+  
+  # 5) Binarize at the chosen threshold & compute metrics
+  pred_class <- factor(ifelse(pred_prob > thr, "phish", "ham"),
+                       levels = c("ham","phish"))
+  cm <- caret::confusionMatrix(pred_class, test$label, positive = "phish")$byClass
+  
+  ba  <- (cm["Sensitivity"] + cm["Specificity"]) / 2
+  prec<-  cm["Pos Pred Value"]
+  rec <-  cm["Sensitivity"]
+  f1  <- ifelse((prec+rec)==0, NA, 2*prec*rec/(prec+rec))
+  
+  # 6) Store
+  final_two <- rbind(final_two, data.frame(
+    Sampling         = samp,
+    Model            = modn,
+    Threshold        = thr,
+    BalancedAccuracy = ba,
+    Precision        = prec,
+    Recall           = rec,
+    F1               = f1,
+    row.names        = NULL
+  ))
+}
+
+# 7) Show the results.
+print(final_recall_champ)
+print(final_two)
+
+```
+
+## R Markdown
+
