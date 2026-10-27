@@ -1,0 +1,306 @@
+---
+title: "Phishing Email Detection: Random Forest vs. Gradient Boosting on Imbalanced Data"
+author: "Luke Wamalwa"
+date: "2025-04-20 (revised 2026-10-27)"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 8, fig.height = 5)
+```
+
+## Question
+
+Can eight simple count features (word counts, links, domains, email addresses,
+spelling errors, urgent keywords) separate phishing from legitimate email, and
+does rebalancing the training data (down-sampling, up-sampling, ROSE) help a
+Random Forest or GBM do it?
+
+Only about 1.3% of emails are phishing, so **accuracy is not used**. A model
+that never flags anything is 98.7% "accurate". The headline metric is
+**PR-AUC** (average precision), with precision, recall and F1 at a chosen
+threshold. ROC-AUC and balanced accuracy are reported for reference.
+
+## Protocol (what touches what)
+
+1. Stratified split of the full dataset: 60% train / 20% validation / 20% test.
+2. Resampling (down / up / ROSE) is applied **to the training set only**.
+   Validation and test keep the real class balance.
+3. Every model is fit on (a version of) the training set and scored on validation.
+4. The champion is chosen **on validation** by PR-AUC, and its decision threshold
+   is chosen **on validation** (the F1-maximising threshold).
+5. The test set is used **once**, for the champion at that fixed threshold.
+   The model is *not* refit on train + validation, because refitting changes
+   the probability scale and would invalidate the validation-tuned threshold.
+
+```{r libraries}
+library(caret)         # createDataPartition, downSample, upSample
+library(ROSE)          # ovun.sample
+library(randomForest)  # Random Forest
+library(gbm)           # Gradient boosting
+library(pROC)          # ROC-AUC
+library(ggplot2)
+
+set.seed(42)
+dir.create("figures", showWarnings = FALSE)
+```
+
+## 1) Load data
+
+Data: [Email Phishing Dataset (Kaggle, ethancratchley)](https://www.kaggle.com/datasets/ethancratchley/email-phishing-dataset/data),
+committed here as `email_phishing_data.csv`. All rows are used (no subsampling).
+
+```{r load}
+df <- read.csv("email_phishing_data.csv")
+df$label <- factor(df$label, levels = c(0, 1), labels = c("ham", "phish"))
+predictors <- setdiff(names(df), "label")
+
+dim(df)
+table(df$label)
+round(prop.table(table(df$label)), 4)
+```
+
+A data-quality note: many rows are exact duplicates of each other on all eight
+features. Short emails naturally collide (e.g. "5 words, 5 unique, 1 stopword,
+nothing else"), and some templated messages repeat thousands of times.
+
+```{r duplicates}
+dup_share <- mean(duplicated(df[, predictors]))
+cat(sprintf("Rows whose feature vector already appeared earlier: %.1f%%\n", 100 * dup_share))
+```
+
+Because of this, a random split puts identical feature vectors in both train and
+test. Section 7 checks how much that flatters the test score.
+
+## 2) Split data
+
+```{r split}
+train_idx  <- createDataPartition(df$label, p = 0.60, list = FALSE)
+train_all  <- df[ train_idx, ]
+rest       <- df[-train_idx, ]
+
+val_idx    <- createDataPartition(rest$label, p = 0.50, list = FALSE)
+validation <- rest[ val_idx, ]
+test       <- rest[-val_idx, ]
+
+sapply(list(train = train_all, validation = validation, test = test),
+       function(d) c(n = nrow(d), phish = sum(d$label == "phish"),
+                     phish_rate = round(mean(d$label == "phish"), 4)))
+```
+
+## 3) Balance the TRAINING set four ways
+
+```{r resample}
+train_down <- downSample(x = train_all[, predictors], y = train_all$label, yname = "label")
+train_up   <- upSample(  x = train_all[, predictors], y = train_all$label, yname = "label")
+N_target   <- max(table(train_all$label)) * 2
+train_rose <- ovun.sample(label ~ ., data = train_all, method = "both",
+                          N = N_target, seed = 42)$data
+
+train_sets <- list(Original = train_all, Down = train_down,
+                   Up = train_up, ROSE = train_rose)
+sapply(train_sets, function(d) table(d$label))
+```
+
+## 4) Helpers: metrics and threshold search
+
+```{r helpers}
+# Average precision (PR-AUC), tie-aware: one PR point per distinct score.
+pr_curve <- function(probs, truth) {
+  y   <- as.integer(truth == "phish")
+  ord <- order(probs, decreasing = TRUE)
+  p   <- probs[ord]; y <- y[ord]
+  last <- c(p[-1] != p[-length(p)], TRUE)       # last row of each tied block
+  tp <- cumsum(y)[last]; fp <- cumsum(1 - y)[last]
+  data.frame(Recall = tp / sum(y), Precision = tp / (tp + fp))
+}
+
+pr_auc <- function(probs, truth) {
+  cv <- pr_curve(probs, truth)
+  sum(diff(c(0, cv$Recall)) * cv$Precision)
+}
+
+compute_metrics <- function(probs, truth, thr) {
+  pred <- probs > thr
+  pos  <- truth == "phish"
+  tp <- sum(pred & pos); fp <- sum(pred & !pos)
+  fn <- sum(!pred & pos); tn <- sum(!pred & !pos)
+  prec <- if (tp + fp == 0) NA else tp / (tp + fp)
+  rec  <- tp / (tp + fn)
+  spec <- tn / (tn + fp)
+  f1   <- if (is.na(prec) || prec + rec == 0) NA else 2 * prec * rec / (prec + rec)
+  c(Threshold = thr, Precision = prec, Recall = rec, F1 = f1,
+    BalancedAccuracy = (rec + spec) / 2, TP = tp, FP = fp, FN = fn, TN = tn)
+}
+
+scan_thresholds <- function(probs, truth, ths = seq(0.01, 0.99, by = 0.01)) {
+  as.data.frame(t(sapply(ths, function(t) compute_metrics(probs, truth, t))))
+}
+
+best_f1_threshold <- function(probs, truth) {
+  m <- scan_thresholds(probs, truth)
+  m[which.max(m$F1), , drop = FALSE]
+}
+```
+
+## 5) Train both models on each training set, evaluate on validation
+
+Random Forest: 100 trees, default settings. GBM: 100 trees, depth 3,
+learning rate 0.1.
+
+```{r fit-models}
+fit_rf <- function(tr) {
+  tr$label <- factor(tr$label, levels = c("ham", "phish"))
+  randomForest(label ~ ., data = tr[, c(predictors, "label")], ntree = 100)
+}
+fit_gbm <- function(tr) {
+  tr$label_n <- ifelse(tr$label == "phish", 1, 0)
+  gbm(label_n ~ ., data = tr[, c(predictors, "label_n")],
+      distribution = "bernoulli", n.trees = 100, interaction.depth = 3,
+      shrinkage = 0.1, bag.fraction = 0.8, n.minobsinnode = 5, verbose = FALSE)
+}
+predict_prob <- function(mod, newdata) {
+  if (inherits(mod, "randomForest")) predict(mod, newdata, type = "prob")[, "phish"]
+  else predict(mod, newdata = newdata[, predictors], n.trees = 100, type = "response")
+}
+
+models <- list(); val_probs <- list(); results <- NULL
+for (balance in names(train_sets)) {
+  for (model_name in c("RandomForest", "GBM")) {
+    key <- paste(balance, model_name, sep = " + ")
+    set.seed(42)
+    mod <- if (model_name == "RandomForest") fit_rf(train_sets[[balance]]) else fit_gbm(train_sets[[balance]])
+    p   <- predict_prob(mod, validation)
+    best <- best_f1_threshold(p, validation$label)
+    models[[key]]    <- mod
+    val_probs[[key]] <- p
+    results <- rbind(results, data.frame(
+      Sampling = balance, Model = model_name,
+      PR_AUC   = pr_auc(p, validation$label),
+      ROC_AUC  = as.numeric(auc(roc(validation$label, p, levels = c("ham", "phish"),
+                                    direction = "<", quiet = TRUE))),
+      Threshold = best$Threshold, Precision = best$Precision,
+      Recall = best$Recall, F1 = best$F1,
+      BalancedAccuracy = best$BalancedAccuracy, row.names = NULL))
+  }
+}
+```
+
+## 6) Validation results and champion selection
+
+No-skill PR-AUC equals the phishing rate in validation:
+`r round(mean(validation$label == "phish"), 4)`.
+
+```{r val-results}
+results <- results[order(-results$PR_AUC), ]
+knitr::kable(results, digits = 3, row.names = FALSE,
+             caption = "Validation set. Threshold = F1-maximising threshold on validation.")
+```
+
+```{r pr-curves, fig.cap="Precision-recall curves on the validation set."}
+curves <- do.call(rbind, lapply(names(val_probs), function(k)
+  cbind(pr_curve(val_probs[[k]], validation$label), Config = k)))
+base_rate <- mean(validation$label == "phish")
+p_pr <- ggplot(curves, aes(Recall, Precision, colour = Config)) +
+  geom_line(linewidth = 0.6) +
+  geom_hline(yintercept = base_rate, linetype = "dashed") +
+  annotate("text", x = 0.85, y = base_rate + 0.03, label = "no-skill baseline", size = 3) +
+  coord_cartesian(ylim = c(0, 1)) +
+  labs(title = "Validation precision-recall curves",
+       subtitle = "Resampling applied to the training set only") +
+  theme_minimal()
+ggsave("figures/pr_curves_validation.png", p_pr, width = 8, height = 5, dpi = 120)
+p_pr
+```
+
+```{r champion}
+champ_row <- results[1, ]
+champ_key <- paste(champ_row$Sampling, champ_row$Model, sep = " + ")
+champ_thr <- champ_row$Threshold
+champ_mod <- models[[champ_key]]
+cat("Champion (highest validation PR-AUC):", champ_key,
+    "\nF1-optimal threshold chosen on validation:", champ_thr, "\n")
+```
+
+A second, high-recall operating point for the same model is also fixed on
+validation: the highest threshold that still catches at least 50% of phishing.
+
+```{r high-recall-thr}
+val_scan <- scan_thresholds(val_probs[[champ_key]], validation$label)
+hr_thr   <- max(val_scan$Threshold[val_scan$Recall >= 0.5])
+cat("High-recall threshold chosen on validation:", hr_thr, "\n")
+```
+
+## 7) Final evaluation on the TEST set (used once)
+
+```{r test-eval}
+test_prob <- predict_prob(champ_mod, test)
+test_metrics <- rbind(
+  `F1-optimal threshold`  = compute_metrics(test_prob, test$label, champ_thr),
+  `High-recall threshold` = compute_metrics(test_prob, test$label, hr_thr))
+test_pr_auc  <- pr_auc(test_prob, test$label)
+test_roc_auc <- as.numeric(auc(roc(test$label, test_prob, levels = c("ham", "phish"),
+                                   direction = "<", quiet = TRUE)))
+cat(sprintf("Test PR-AUC: %.3f (no-skill %.4f)   Test ROC-AUC: %.3f\n",
+            test_pr_auc, mean(test$label == "phish"), test_roc_auc))
+knitr::kable(test_metrics, digits = 3,
+             caption = paste("Test set,", champ_key))
+```
+
+```{r threshold-plot, fig.cap="Precision and recall on the test set as the threshold moves. Dotted lines mark the two thresholds fixed on validation."}
+test_scan <- scan_thresholds(test_prob, test$label)
+long <- rbind(data.frame(Threshold = test_scan$Threshold, Metric = "Precision", Value = test_scan$Precision),
+              data.frame(Threshold = test_scan$Threshold, Metric = "Recall",    Value = test_scan$Recall))
+p_thr <- ggplot(long, aes(Threshold, Value, colour = Metric)) +
+  geom_line(linewidth = 0.8, na.rm = TRUE) +
+  geom_vline(xintercept = c(champ_thr, hr_thr), linetype = "dotted") +
+  labs(title = paste("Test set precision / recall vs threshold:", champ_key)) +
+  theme_minimal()
+ggsave("figures/test_threshold_tradeoff.png", p_thr, width = 8, height = 5, dpi = 120)
+p_thr
+```
+
+### Robustness: test emails whose feature vector never appears in training
+
+This is a diagnostic, not a model-selection step: nothing is tuned on it.
+
+```{r unseen}
+key_of <- function(d) do.call(paste, d[, predictors])
+unseen <- !(key_of(test) %in% key_of(train_all))
+cat(sprintf("Test rows with a feature vector unseen in training: %d of %d (%.1f%%), phishing rate %.4f\n",
+            sum(unseen), nrow(test), 100 * mean(unseen), mean(test$label[unseen] == "phish")))
+cat(sprintf("PR-AUC on unseen rows: %.3f (no-skill %.4f)\nPR-AUC on rows also seen in training: %.3f (no-skill %.4f)\n",
+            pr_auc(test_prob[unseen], test$label[unseen]),  mean(test$label[unseen] == "phish"),
+            pr_auc(test_prob[!unseen], test$label[!unseen]), mean(test$label[!unseen] == "phish")))
+knitr::kable(rbind(
+  `Unseen, F1 threshold` = compute_metrics(test_prob[unseen],  test$label[unseen],  champ_thr),
+  `Seen, F1 threshold`   = compute_metrics(test_prob[!unseen], test$label[!unseen], champ_thr)),
+  digits = 3)
+```
+
+## Conclusions
+
+- The best model is the plain Random Forest on the **original, un-resampled**
+  training data (validation PR-AUC `r round(results$PR_AUC[1], 3)`, test PR-AUC
+  `r round(test_pr_auc, 3)` against a no-skill `r round(mean(test$label == "phish"), 4)`).
+- Resampling raised ROC-AUC slightly but **lowered PR-AUC** for both model
+  families: it improves ranking over the whole range but hurts the
+  high-precision end, which is what matters when ~99% of email is legitimate.
+- At the validation-chosen threshold (`r champ_thr`) the champion catches
+  `r round(100 * test_metrics[1, "Recall"])`% of test phishing with
+  `r round(100 * test_metrics[1, "Precision"])`% precision. Pushing recall above
+  50% costs precision sharply (`r round(100 * test_metrics[2, "Precision"])`% at threshold `r hr_thr`).
+- Part of the score comes from feature vectors that also occur in training;
+  on unseen vectors the model still beats the no-skill baseline clearly, but
+  precision and recall are lower.
+- These eight count features carry real but limited signal. Message text,
+  sender/header information and URL reputation would be needed for a
+  production-grade filter.
+
+```{r session}
+sessionInfo()
+```
